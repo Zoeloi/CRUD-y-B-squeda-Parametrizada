@@ -9,13 +9,20 @@ import javafx.scene.control.cell.PropertyValueFactory;
 
 import com.appregistros.proyectocrud.model.Producto;
 
+import java.math.BigDecimal;
 import java.sql.Connection;
+import java.sql.Date;
+import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.Statement;
+import java.time.LocalDate;
+import java.util.ArrayList;
+import java.util.List;
 
 public class ProductoController {
 
+    // ====================== Formulario ======================
     @FXML
     private TextField txtCodigo;
     @FXML
@@ -42,6 +49,7 @@ public class ProductoController {
     @FXML
     private Button btnEliminar;
 
+    // ====================== Filtros ======================
     @FXML
     private TextField txtBuscar;
     @FXML
@@ -63,6 +71,7 @@ public class ProductoController {
     @FXML
     private Button btnLimpiar;
 
+    // ====================== Tabla ======================
     @FXML
     private TableView<Producto> tblProductos;
     @FXML
@@ -78,10 +87,11 @@ public class ProductoController {
     @FXML
     private TableColumn<Producto, Integer> colStock;
     @FXML
-    private TableColumn<Producto, java.time.LocalDate> colFecha;
+    private TableColumn<Producto, LocalDate> colFecha;
 
     private final ObservableList<Producto> productos = FXCollections.observableArrayList();
 
+    // ====================== Inicialización ======================
     @FXML
     public void initialize() {
         colCodigo.setCellValueFactory(new PropertyValueFactory<>("codigo"));
@@ -94,11 +104,21 @@ public class ProductoController {
 
         tblProductos.setItems(productos);
 
+        // Estas opciones funcionan como whitelist del ORDER BY
         cmbOrdenar.setItems(FXCollections.observableArrayList(
-                "Nombre", "Precio", "Stock", "Fecha de creación"));
+                "Nombre",
+                "Precio menor a mayor",
+                "Precio mayor a menor",
+                "Fecha más reciente",
+                "Fecha más antigua",
+                "Stock mayor a menor",
+                "Stock menor a mayor"));
+        cmbOrdenar.setValue("Nombre");
 
         cargarCombos();
-        CargarProductos();
+
+        // false = no mostrar alerta de "sin resultados" al abrir la ventana
+        cargarProductos(false);
 
         tblProductos.getSelectionModel().selectedItemProperty().addListener(
                 (obs, anterior, seleccionado) -> {
@@ -135,35 +155,98 @@ public class ProductoController {
         txtNombre.setText(p.getNombre());
         txtPrecio.setText(String.valueOf(p.getPrecio()));
         txtStock.setText(String.valueOf(p.getStock()));
+        txtDescripcion.setText(p.getDescripcion());
         cmbCategoria.setValue(p.getCategoria());
         cmbMarca.setValue(p.getMarca());
         dpFecha.setValue(p.getFechaCreacion());
     }
 
+    // ====================== Acciones del formulario ======================
     @FXML
     private void onNuevo() {
         limpiarFormulario();
         tblProductos.getSelectionModel().clearSelection();
     }
 
+    // INSERT
     @FXML
     private void onGuardar() {
         if (!validarFormulario()) return;
-        mostrarAlerta(Alert.AlertType.INFORMATION, "Producto guardado.");
-        onBuscar();
-        limpiarFormulario();
+
+        String codigo = txtCodigo.getText().trim();
+
+        if (existeCodigo(codigo, 0)) {
+            mostrarAlerta(Alert.AlertType.WARNING, "Ya existe un producto activo con el código " + codigo + ".");
+            return;
+        }
+
+        String sql = """
+                INSERT INTO catalogos.productos
+                    (codigo, nombre, descripcion, precio, stock, fecha_creacion, id_categoria, id_marca, estado)
+                VALUES (?, ?, ?, ?, ?, ?,
+                    (SELECT id_categoria FROM catalogos.categorias WHERE nombre = ? AND estado = 1 LIMIT 1),
+                    (SELECT id_marca FROM catalogos.marcas WHERE nombre = ? AND estado = 1 LIMIT 1),
+                    1)
+                """;
+
+        try (Connection connection = DatabaseConnection.getConnection();
+             PreparedStatement ps = connection.prepareStatement(sql)) {
+
+            asignarParametrosFormulario(ps);
+            ps.executeUpdate();
+
+            mostrarAlerta(Alert.AlertType.INFORMATION, "Producto guardado correctamente.");
+            limpiarFormulario();
+            // Se limpian los filtros para que el producto nuevo se vea en la tabla
+            onLimpiarFiltros();
+
+        } catch (SQLException ex) {
+            manejarErrorBD("No se pudo guardar el producto.", ex);
+        }
     }
 
+    // UPDATE
     @FXML
     private void onActualizar() {
-        if (tblProductos.getSelectionModel().getSelectedItem() == null) {
+        Producto seleccionado = tblProductos.getSelectionModel().getSelectedItem();
+        if (seleccionado == null) {
             mostrarAlerta(Alert.AlertType.WARNING, "Selecciona un producto de la tabla.");
             return;
         }
         if (!validarFormulario()) return;
-        onBuscar();
+
+        String codigo = txtCodigo.getText().trim();
+
+        if (existeCodigo(codigo, seleccionado.getIdProducto())) {
+            mostrarAlerta(Alert.AlertType.WARNING, "Ya existe otro producto activo con el código " + codigo + ".");
+            return;
+        }
+
+        String sql = """
+                UPDATE catalogos.productos
+                SET codigo = ?, nombre = ?, descripcion = ?, precio = ?, stock = ?, fecha_creacion = ?,
+                    id_categoria = (SELECT id_categoria FROM catalogos.categorias WHERE nombre = ? AND estado = 1 LIMIT 1),
+                    id_marca = (SELECT id_marca FROM catalogos.marcas WHERE nombre = ? AND estado = 1 LIMIT 1)
+                WHERE id_producto = ?
+                """;
+
+        try (Connection connection = DatabaseConnection.getConnection();
+             PreparedStatement ps = connection.prepareStatement(sql)) {
+
+            asignarParametrosFormulario(ps);
+            ps.setInt(9, seleccionado.getIdProducto());
+            ps.executeUpdate();
+
+            mostrarAlerta(Alert.AlertType.INFORMATION, "Producto actualizado correctamente.");
+            limpiarFormulario();
+            cargarProductos(false);
+
+        } catch (SQLException ex) {
+            manejarErrorBD("No se pudo actualizar el producto.", ex);
+        }
     }
 
+    // DELETE lógico (estado = 0)
     @FXML
     private void onEliminar() {
         Producto seleccionado = tblProductos.getSelectionModel().getSelectedItem();
@@ -171,14 +254,76 @@ public class ProductoController {
             mostrarAlerta(Alert.AlertType.WARNING, "Selecciona un producto de la tabla.");
             return;
         }
-        onBuscar();
-        limpiarFormulario();
+
+        Alert confirmacion = new Alert(Alert.AlertType.CONFIRMATION);
+        confirmacion.setHeaderText(null);
+        confirmacion.setContentText("¿Eliminar el producto \"" + seleccionado.getNombre() + "\"?");
+        if (confirmacion.showAndWait().orElse(ButtonType.CANCEL) != ButtonType.OK) return;
+
+        String sql = "UPDATE catalogos.productos SET estado = 0 WHERE id_producto = ?";
+
+        try (Connection connection = DatabaseConnection.getConnection();
+             PreparedStatement ps = connection.prepareStatement(sql)) {
+
+            ps.setInt(1, seleccionado.getIdProducto());
+            ps.executeUpdate();
+
+            mostrarAlerta(Alert.AlertType.INFORMATION, "Producto eliminado correctamente.");
+            limpiarFormulario();
+            cargarProductos(false);
+
+        } catch (SQLException ex) {
+            manejarErrorBD("No se pudo eliminar el producto.", ex);
+        }
     }
 
-    //  Acciones de filtros
+    // Asigna los 8 primeros parámetros comunes de INSERT y UPDATE
+    private void asignarParametrosFormulario(PreparedStatement ps) throws SQLException {
+        LocalDate fecha = dpFecha.getValue() != null ? dpFecha.getValue() : LocalDate.now();
+
+        ps.setString(1, txtCodigo.getText().trim());
+        ps.setString(2, txtNombre.getText().trim());
+        ps.setString(3, txtDescripcion.getText() == null ? "" : txtDescripcion.getText().trim());
+        ps.setBigDecimal(4, new BigDecimal(txtPrecio.getText().trim()));
+        ps.setInt(5, Integer.parseInt(txtStock.getText().trim()));
+        ps.setDate(6, Date.valueOf(fecha));
+        ps.setString(7, cmbCategoria.getValue());
+        ps.setString(8, cmbMarca.getValue());
+    }
+
+    // Verifica si ya hay otro producto activo con ese código (idExcluir = 0 en INSERT)
+    private boolean existeCodigo(String codigo, int idExcluir) {
+        String sql = "SELECT 1 FROM catalogos.productos WHERE codigo = ? AND estado = 1 AND id_producto <> ?";
+        try (Connection connection = DatabaseConnection.getConnection();
+             PreparedStatement ps = connection.prepareStatement(sql)) {
+            ps.setString(1, codigo);
+            ps.setInt(2, idExcluir);
+            try (ResultSet rs = ps.executeQuery()) {
+                return rs.next();
+            }
+        } catch (SQLException ex) {
+            manejarErrorBD("No se pudo verificar el código.", ex);
+            return true; // ante error, no continuar con el guardado
+        }
+    }
+
+    private void manejarErrorBD(String mensaje, SQLException ex) {
+        System.out.println(mensaje + " " + ex.getMessage());
+        ex.printStackTrace();
+        mostrarAlerta(Alert.AlertType.ERROR, mensaje + "\n" + ex.getMessage());
+    }
+
+    // Botón "Actualizar tabla": vuelve a consultar la BD respetando los filtros actuales
+    @FXML
+    private void ActualizarTabla() {
+        cargarProductos(false);
+    }
+
+    // ====================== Acciones de filtros ======================
     @FXML
     private void onBuscar() {
-        CargarProductos();
+        // true = si no hay resultados, avisar al usuario
+        cargarProductos(true);
     }
 
     @FXML
@@ -190,11 +335,11 @@ public class ProductoController {
         txtPrecioMin.clear();
         txtPrecioMax.clear();
         chkSoloConStock.setSelected(false);
-        cmbOrdenar.setValue(null);
-        onBuscar();
+        cmbOrdenar.setValue("Nombre");
+        cargarProductos(false);
     }
 
-    // Utilidades
+    // ====================== Utilidades ======================
     private boolean validarFormulario() {
         if (txtCodigo.getText().isBlank() || txtNombre.getText().isBlank()
                 || cmbCategoria.getValue() == null || cmbMarca.getValue() == null) {
@@ -237,43 +382,173 @@ public class ProductoController {
         alerta.showAndWait();
     }
 
-    private void CargarProductos() {
-        System.out.println("CargarProductos invoked");
+    // ====================== BÚSQUEDA PARAMETRIZADA ======================
+    /**
+     * Consulta los productos aplicando todos los filtros de la sección
+     * "Búsqueda y filtros".
+     *
+     * @param avisarSinResultados si es true y la consulta no devuelve filas,
+     *                            se muestra una alerta informativa.
+     *                            (En initialize() debe ser false: JavaFX no
+     *                            permite showAndWait durante la carga de la vista.)
+     */
+    private void cargarProductos(boolean avisarSinResultados) {
+
+        // ---------- 1. Leer y validar los filtros ----------
+        String texto = txtBuscar.getText() == null ? "" : txtBuscar.getText().trim();
+        String categoria = cmbFiltroCategoria.getValue();
+        LocalDate desde = dpDesde.getValue();
+        LocalDate hasta = dpHasta.getValue();
+        boolean soloConStock = chkSoloConStock.isSelected();
+
+        if (desde != null && hasta != null && desde.isAfter(hasta)) {
+            mostrarAlerta(Alert.AlertType.WARNING,
+                    "La fecha 'Desde' no puede ser posterior a la fecha 'Hasta'.");
+            return;
+        }
+
+        BigDecimal precioMin = null;
+        BigDecimal precioMax = null;
+        try {
+            if (txtPrecioMin.getText() != null && !txtPrecioMin.getText().isBlank()) {
+                precioMin = new BigDecimal(txtPrecioMin.getText().trim());
+            }
+            if (txtPrecioMax.getText() != null && !txtPrecioMax.getText().isBlank()) {
+                precioMax = new BigDecimal(txtPrecioMax.getText().trim());
+            }
+        } catch (NumberFormatException e) {
+            mostrarAlerta(Alert.AlertType.WARNING,
+                    "El precio mínimo y el precio máximo deben ser numéricos.");
+            return;
+        }
+
+        if (precioMin != null && precioMax != null && precioMin.compareTo(precioMax) > 0) {
+            mostrarAlerta(Alert.AlertType.WARNING,
+                    "El precio mínimo no puede ser mayor que el precio máximo.");
+            return;
+        }
+
+        // ---------- 2. Construir el SQL dinámico ----------
+        // La consulta siempre incluye p.estado = 1 para no mostrar
+        // productos eliminados lógicamente.
+        StringBuilder sql = new StringBuilder("""
+                SELECT p.id_producto, p.codigo, p.nombre, p.descripcion,
+                       p.precio, p.stock, p.fecha_creacion,
+                       c.nombre AS categoria, m.nombre AS marca
+                FROM catalogos.productos p
+                INNER JOIN catalogos.categorias c ON p.id_categoria = c.id_categoria
+                INNER JOIN catalogos.marcas m ON p.id_marca = m.id_marca
+                WHERE p.estado = 1
+                """);
+
+        // Valores que se enviarán al PreparedStatement, en el mismo orden de los ?
+        List<Object> parametros = new ArrayList<>();
+
+        // Código o nombre (búsqueda parcial, sin distinguir mayúsculas)
+        if (!texto.isBlank()) {
+            sql.append(" AND (p.codigo ILIKE ? OR p.nombre ILIKE ?) ");
+            parametros.add("%" + texto + "%");
+            parametros.add("%" + texto + "%");
+        }
+
+        // Categoría
+        if (categoria != null) {
+            sql.append(" AND c.nombre = ? ");
+            parametros.add(categoria);
+        }
+
+        // Rango de fechas
+        if (desde != null) {
+            sql.append(" AND p.fecha_creacion >= ? ");
+            parametros.add(desde);
+        }
+        if (hasta != null) {
+            sql.append(" AND p.fecha_creacion <= ? ");
+            parametros.add(hasta);
+        }
+
+        // Rango de precios
+        if (precioMin != null) {
+            sql.append(" AND p.precio >= ? ");
+            parametros.add(precioMin);
+        }
+        if (precioMax != null) {
+            sql.append(" AND p.precio <= ? ");
+            parametros.add(precioMax);
+        }
+
+        // Solo productos con existencias (condición fija, sin parámetro)
+        if (soloConStock) {
+            sql.append(" AND p.stock > 0 ");
+        }
+
+        // ORDER BY: los nombres de columna no se pueden enviar como ?,
+        // por eso se usa una whitelist con las opciones del ComboBox.
+        String orden = cmbOrdenar.getValue() == null ? "Nombre" : cmbOrdenar.getValue();
+
+        switch (orden) {
+            case "Precio menor a mayor" -> sql.append(" ORDER BY p.precio ASC ");
+            case "Precio mayor a menor" -> sql.append(" ORDER BY p.precio DESC ");
+            case "Fecha más reciente"   -> sql.append(" ORDER BY p.fecha_creacion DESC ");
+            case "Fecha más antigua"    -> sql.append(" ORDER BY p.fecha_creacion ASC ");
+            case "Stock mayor a menor"  -> sql.append(" ORDER BY p.stock DESC ");
+            case "Stock menor a mayor"  -> sql.append(" ORDER BY p.stock ASC ");
+            default                     -> sql.append(" ORDER BY p.nombre ASC ");
+        }
+
+        // ---------- 3. Ejecutar la consulta ----------
         productos.clear();
 
-        String sql = "SELECT p.id_producto, p.codigo, p.nombre, p.descripcion, p.precio, p.stock, p.fecha_creacion, " +
-               "c.nombre AS categoria, m.nombre AS marca " +
-               "FROM catalogos.productos p " +
-               "INNER JOIN catalogos.categorias c ON p.id_categoria = c.id_categoria " +
-               "INNER JOIN catalogos.marcas m ON p.id_marca = m.id_marca " +
-               "WHERE p.estado = 1 " +
-               "ORDER BY p.id_producto";
-
         try (Connection connection = DatabaseConnection.getConnection();
-             Statement statement = connection.createStatement();
-             ResultSet resultSet = statement.executeQuery(sql)) {
-            while (resultSet.next()) {
-               int id = resultSet.getInt("id_producto");
-               String codigo = resultSet.getString("codigo");
-               String nombre = resultSet.getString("nombre");
-               String categoria = resultSet.getString("categoria");
-               String marca = resultSet.getString("marca");
-               Double precio = resultSet.getDouble("precio");
-               int stock = resultSet.getInt("stock");
-               java.time.LocalDate fechaCreacion = resultSet.getDate("fecha_creacion").toLocalDate();
-               Producto producto = new Producto(id, codigo, resultSet.getString("descripcion"), nombre, precio, stock, fechaCreacion, 0, categoria, 0, marca, 1);
-               productos.add(producto);
+             PreparedStatement ps = connection.prepareStatement(sql.toString())) {
+
+            // Asignar los parámetros dinámicamente
+            for (int i = 0; i < parametros.size(); i++) {
+                Object valor = parametros.get(i);
+
+                if (valor instanceof LocalDate fecha) {
+                    ps.setDate(i + 1, Date.valueOf(fecha));
+                } else if (valor instanceof BigDecimal numero) {
+                    ps.setBigDecimal(i + 1, numero);
+                } else {
+                    ps.setObject(i + 1, valor);
+                }
+            }
+
+            try (ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    productos.add(crearProductoDesdeResultSet(rs));
+                }
             }
 
             tblProductos.setItems(productos);
 
+            if (avisarSinResultados && productos.isEmpty()) {
+                mostrarAlerta(Alert.AlertType.INFORMATION,
+                        "No existen productos que coincidan con los filtros aplicados.");
+            }
+
         } catch (SQLException ex) {
-            System.out.println("error al cargar Productos: " + ex.getMessage());
+            System.out.println("error al buscar productos: " + ex.getMessage());
             ex.printStackTrace();
+            mostrarAlerta(Alert.AlertType.ERROR, "No se pudo realizar la búsqueda.");
         }
     }
-  @FXML
-    private void ActualizarTabla() {
-      tblProductos.refresh();
+
+    // Convierte una fila del ResultSet en un objeto Producto
+    private Producto crearProductoDesdeResultSet(ResultSet rs) throws SQLException {
+        return new Producto(
+                rs.getInt("id_producto"),
+                rs.getString("codigo"),
+                rs.getString("descripcion"),
+                rs.getString("nombre"),
+                rs.getDouble("precio"),
+                rs.getInt("stock"),
+                rs.getDate("fecha_creacion").toLocalDate(),
+                0,
+                rs.getString("categoria"),
+                0,
+                rs.getString("marca"),
+                1);
     }
 }
